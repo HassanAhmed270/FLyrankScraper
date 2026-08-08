@@ -140,6 +140,51 @@ async function crawlCatalogue() {
 function getBookCacheFile(index) {
     return path.join(__dirname, `../cache/books/${index}.html`);
 }
+async function fetchBookPage(bookUrl, index) {
+    let attempt = 0;
+
+    while (attempt < 2) {
+        try {
+            const response = await fetch(bookUrl, {
+                headers: {
+                    "User-Agent": "FlyRankInternshipA9/1.0 (+YOUR-REPO-URL)"
+                },
+                signal: AbortSignal.timeout(5000)
+            });
+
+            if (response.status === 200) {
+                return await response.text();
+            }
+
+            if (response.status === 403 || response.status === 404) {
+                throw new Error(
+                    `Book page ${index} failed with status ${response.status}`
+                );
+            }
+
+            if (response.status >= 500 && response.status <= 599 && attempt === 0) {
+                attempt++;
+                await wait(1000);
+                continue;
+            }
+
+            throw new Error(
+                `Book page ${index} failed with status ${response.status}`
+            );
+        } catch (error) {
+            if (
+                error.name === "TimeoutError" &&
+                attempt === 0
+            ) {
+                attempt++;
+                await wait(1000);
+                continue;
+            }
+
+            throw error;
+        }
+    }
+}
 async function getBookHtml(bookUrl, index) {
     const cacheFile = getBookCacheFile(index);
     const metadataFile = path.join(__dirname, `../cache/books/${index}.json`);
@@ -163,20 +208,7 @@ async function getBookHtml(bookUrl, index) {
 
     await wait(500);
 
-    const response = await fetch(bookUrl, {
-        headers: {
-            "User-Agent": "FlyRankInternshipA9/1.0 (https://github.com/HassanAhmed270/FLyrankScraper.git)"
-        },
-        signal: AbortSignal.timeout(5000)
-    });
-
-    if (response.status !== 200) {
-        throw new Error(
-            `Book page ${index} failed with status ${response.status}`
-        );
-    }
-
-    const html = await response.text();
+    const html = await fetchBookPage(bookUrl, index);
     const fetchedAt = new Date().toISOString();
 
     await fs.mkdir(path.dirname(cacheFile), { recursive: true });
@@ -228,85 +260,144 @@ function extractBookRecord(html, productUrl, sourcePage, fetchedAt) {
         fetched_at: fetchedAt
     };
 }
-function validateBooks(records) {
-  const validRecords = [];
-  const errors = [];
+function validateBooks(records, stats) {
+    const validRecords = [];
+    const errors = [];
 
-  for (const record of records) {
-    const normalized = normalizeBook(record);
-    const result = bookSchema.safeParse(normalized);
+    for (const record of records) {
+        const normalized = normalizeBook(record);
+        const result = bookSchema.safeParse(normalized);
 
-    if (result.success) {
-      validRecords.push(result.data);
-    } else {
-      errors.push({
-        product_url: record.product_url,
-        reason: result.error.issues.map((issue) => issue.message)
-      });
+        if (result.success) {
+            validRecords.push(result.data);
+            stats.valid_records++;
+        } else {
+            stats.invalid_records++;
+
+            errors.push({
+                product_url: record.product_url,
+                reason: result.error.issues.map((issue) => issue.message)
+            });
+        }
     }
-  }
 
-  return {
-    validRecords,
-    errors
-  };
+    return {
+        validRecords,
+        errors
+    };
 }
 async function saveOutput(validRecords, errors) {
-  const outputDir = path.join(__dirname, "../output");
+    const outputDir = path.join(__dirname, "../output");
 
-  await fs.mkdir(outputDir, { recursive: true });
+    await fs.mkdir(outputDir, { recursive: true });
 
-  await fs.writeFile(
-    path.join(outputDir, "books.json"),
-    JSON.stringify(validRecords, null, 2),
-    "utf8"
-  );
-
-  await fs.writeFile(
-    path.join(outputDir, "errors.json"),
-    JSON.stringify(errors, null, 2),
-    "utf8"
-  );
-}
-async function extractAllBooks(bookLinks) {
-  const records = [];
-
-  for (let index = 0; index < bookLinks.length; index++) {
-    const { url, sourcePage } = bookLinks[index];
-
-    const { html, fetchedAt } = await getBookHtml(url, index + 1);
-
-    const record = extractBookRecord(
-      html,
-      url,
-      sourcePage,
-      fetchedAt
+    await fs.writeFile(
+        path.join(outputDir, "books.json"),
+        JSON.stringify(validRecords, null, 2),
+        "utf8"
     );
 
-    records.push(record);
-  }
+    await fs.writeFile(
+        path.join(outputDir, "errors.json"),
+        JSON.stringify(errors, null, 2),
+        "utf8"
+    );
+}
+async function saveRunReport(stats) {
+    const duration = Date.now() - new Date(stats.start_time).getTime();
 
-  return records;
+    const report = {
+        start_time: stats.start_time,
+        duration_ms: duration,
+        pages_fetched: stats.pages_fetched,
+        cache_hits: stats.cache_hits,
+        valid_records: stats.valid_records,
+        invalid_records: stats.invalid_records,
+        failed_pages: stats.failed_pages
+    };
+
+    const outputDir = path.join(__dirname, "../output");
+
+    await fs.mkdir(outputDir, { recursive: true });
+
+    await fs.writeFile(
+        path.join(outputDir, "run-report.json"),
+        JSON.stringify(report, null, 2),
+        "utf8"
+    );
+}
+async function extractAllBooks(bookLinks, stats) {
+    const records = [];
+
+    for (let index = 0; index < bookLinks.length; index++) {
+        const { url, sourcePage } = bookLinks[index];
+
+        try {
+            const { html, fetchedAt, fromCache } = await getBookHtml(
+                url,
+                index + 1
+            );
+
+            if (fromCache) {
+                stats.cache_hits++;
+            } else {
+                stats.pages_fetched++;
+            }
+
+            const record = extractBookRecord(
+                html,
+                url,
+                sourcePage,
+                fetchedAt
+            );
+
+            records.push(record);
+        } catch (error) {
+            stats.failed_pages++;
+
+            console.error(
+                `FAILED ${url} - ${error.message}`
+            );
+        }
+    }
+
+    return records;
+}
+function createRunStats() {
+    return {
+        start_time: new Date().toISOString(),
+        pages_fetched: 0,
+        cache_hits: 0,
+        valid_records: 0,
+        invalid_records: 0,
+        failed_pages: 0
+    };
 }
 async function main() {
-  const { cataloguePages, bookLinks } = await crawlCatalogue();
+    const stats = createRunStats();
+    const { cataloguePages, bookLinks } = await crawlCatalogue();
+    bookLinks.push({
+        url: "https://books.toscrape.com/this-book-does-not-exist/",
+        sourcePage: cataloguePages[0]
+    });
 
-  console.log(`catalogue_pages=${cataloguePages.length}`);
-  console.log(`book_links=${bookLinks.length}`);
+    console.log(`catalogue_pages=${cataloguePages.length}`);
+    console.log(`book_links=${bookLinks.length}`);
 
-  const records = await extractAllBooks(bookLinks);
+    const records = await extractAllBooks(bookLinks, stats);
 
-  console.log(`detail_pages=${records.length}`);
+    console.log(`detail_pages=${records.length}`);
 
-  const { validRecords, errors } = validateBooks(records);
+    const { validRecords, errors } = validateBooks(records, stats);
 
-  await saveOutput(validRecords, errors);
+    await saveOutput(validRecords, errors);
+    await saveRunReport(stats);
 
-  console.log(`valid_records=${validRecords.length}`);
-  console.log(`errors=${errors.length}`);
+    console.log(`valid_records=${validRecords.length}`);
+    console.log(`errors=${errors.length}`);
 }
 
 main().catch((error) => {
-  console.error(`ERROR - ${error.message}`);
-  process.exitCode = 1;
+    console.error(`ERROR - ${error.message}`);
+    process.exitCode = 1;
 });
