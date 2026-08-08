@@ -2,6 +2,8 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import * as cheerio from "cheerio";
+import { bookSchema } from "./schema.js";
+import { normalizeBook } from "./normalizer.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -226,6 +228,46 @@ function extractBookRecord(html, productUrl, sourcePage, fetchedAt) {
         fetched_at: fetchedAt
     };
 }
+function validateBooks(records) {
+  const validRecords = [];
+  const errors = [];
+
+  for (const record of records) {
+    const normalized = normalizeBook(record);
+    const result = bookSchema.safeParse(normalized);
+
+    if (result.success) {
+      validRecords.push(result.data);
+    } else {
+      errors.push({
+        product_url: record.product_url,
+        reason: result.error.issues.map((issue) => issue.message)
+      });
+    }
+  }
+
+  return {
+    validRecords,
+    errors
+  };
+}
+async function saveOutput(validRecords, errors) {
+  const outputDir = path.join(__dirname, "../output");
+
+  await fs.mkdir(outputDir, { recursive: true });
+
+  await fs.writeFile(
+    path.join(outputDir, "books.json"),
+    JSON.stringify(validRecords, null, 2),
+    "utf8"
+  );
+
+  await fs.writeFile(
+    path.join(outputDir, "errors.json"),
+    JSON.stringify(errors, null, 2),
+    "utf8"
+  );
+}
 async function extractAllBooks(bookLinks) {
   const records = [];
 
@@ -255,7 +297,13 @@ async function main() {
   const records = await extractAllBooks(bookLinks);
 
   console.log(`detail_pages=${records.length}`);
-  console.log(JSON.stringify(records[0], null, 2));
+
+  const { validRecords, errors } = validateBooks(records);
+
+  await saveOutput(validRecords, errors);
+
+  console.log(`valid_records=${validRecords.length}`);
+  console.log(`errors=${errors.length}`);
 }
 
 main().catch((error) => {
